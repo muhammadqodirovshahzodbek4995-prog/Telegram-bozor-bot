@@ -1492,7 +1492,7 @@ def main():
     import asyncio
     asyncio.set_event_loop(asyncio.new_event_loop())
     
-    TOKEN = "8213220755:AAEitj0sJeIHU7D1q_Hs63nRO-3SO22I32I"
+    TOKEN = "8213220755:AAEko56m0rknjXcD01g6PS826IBHgQ3F_A8"
 
     app = Application.builder().token(TOKEN).build()
 
