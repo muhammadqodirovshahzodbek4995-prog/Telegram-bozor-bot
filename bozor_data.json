@@ -346,6 +346,13 @@
             "qty": 2,
             "unit": "dona"
           }
+        ],
+        "muxayyoxon": [
+          {
+            "name": "Kars kurs",
+            "qty": 2,
+            "unit": "dona"
+          }
         ]
       }
     },
