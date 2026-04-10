@@ -1489,7 +1489,10 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ======================== MAIN ========================
 def main():
-    TOKEN = "8213220755:AAEitj0sJeIHU7D1q_Hs63nRO-3SO22I32I"  # <-- tokeningizni shu yerga qo'ying
+    import asyncio
+    asyncio.set_event_loop(asyncio.new_event_loop())
+    
+    TOKEN = "8213220755:AAEitj0sJeIHU7D1q_Hs63nRO-3SO22I32I"
 
     app = Application.builder().token(TOKEN).build()
 
