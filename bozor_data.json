@@ -349,6 +349,17 @@
         ]
       }
     },
-    "narxlar": {}
+    "narxlar": {
+      "2026-04-01": {
+        "sinov": {
+          "1": {
+            "price_per_unit": 10000.0,
+            "qty": 2,
+            "unit": "dona",
+            "total": 20000.0
+          }
+        }
+      }
+    }
   }
 }
