@@ -1,772 +1,1303 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os
-import json
 import asyncio
-import threading
+import asyncpg
 import logging
-from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
-
-from telegram import Update, ReplyKeyboardMarkup
+from datetime import datetime, date
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    filters, ContextTypes, ConversationHandler
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters, ConversationHandler
 )
 
-# ══════════════════════════════════════════════════════
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TOKEN     = os.environ.get("BOT_TOKEN", "YOUR_TOKEN_HERE")
-DATA_FILE = os.environ.get("DATA_FILE", "data.json")
-PORT      = int(os.environ.get("PORT", 8080))
+TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# ══════════════════════════════════════════════════════
-#  HEALTH SERVER  (Render uxlamasin)
-# ══════════════════════════════════════════════════════
-class H(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200); self.end_headers()
-        self.wfile.write(b"OK - Bot ishlayapti!")
-    def log_message(self, *a): pass
-
-def health():
-    HTTPServer(("0.0.0.0", PORT), H).serve_forever()
-
-# ══════════════════════════════════════════════════════
-#  DATA
-# ══════════════════════════════════════════════════════
-def load():
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except: pass
-    return {}
-
-def save(data):
-    d = os.path.dirname(DATA_FILE)
-    if d: os.makedirs(d, exist_ok=True)
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-def usr(data, uid):
-    uid = str(uid)
-    if uid not in data:
-        now = datetime.now()
-        data[uid] = {
-            "year": now.year, "month": now.month,
-            "shops": {"Kalbasa do'kon": []},
-            "cart": {}, "prices": {}
-        }
-    return data[uid]
-
-# ══════════════════════════════════════════════════════
-#  STATES
-# ══════════════════════════════════════════════════════
-(S_MAIN, S_CY, S_CM,
- S_LST, S_AS, S_DS, S_SH, S_AI, S_DI,
- S_MD, S_MSH, S_MI, S_MU, S_MQ, S_MAI, S_MDL,
- S_PD, S_PSH, S_PI, S_PCU, S_PKG, S_PDN, S_PE,
- S_RD, S_ST, S_UD, S_BD) = range(27)
+# States
+(MAIN_MENU, SELECT_YEAR, SELECT_MONTH,
+ SHOP_MENU, ADD_SHOP, DELETE_SHOP,
+ SHOP_ITEMS_MENU, ADD_ITEM, DELETE_ITEM,
+ BOZOR_SELECT_DATE, BOZOR_SHOP_MENU, BOZOR_ITEM_SELECT,
+ BOZOR_UNIT_SELECT, BOZOR_KG_SELECT, BOZOR_DONA_SELECT,
+ NARX_SELECT_DATE, NARX_SHOP_MENU, NARX_ITEM_MENU, NARX_UNIT_CHANGE,
+ NARX_KG_CHANGE, NARX_DONA_CHANGE, ENTER_PRICE,
+ HISOBOT_DATE, OXIRGI_AMAL_DATE,
+ CHANGE_YEAR, CHANGE_MONTH) = range(25)
 
 MONTHS = ["Yanvar","Fevral","Mart","Aprel","May","Iyun",
           "Iyul","Avgust","Sentabr","Oktabr","Noyabr","Dekabr"]
-ME = ["❄️","🌧️","🌱","🌸","🌻","☀️","🏖️","🍉","🍂","🎃","🍁","🎄"]
 
-def kb(r): return ReplyKeyboardMarkup(r, resize_keyboard=True, one_time_keyboard=False)
-def MKB(): return kb([
-    ["📋 Ro'yxat kiritish",   "🛒 Bozorga ro'yxat"],
-    ["💰 Narxlarni kiritish", "📊 Kunlik xisobot"],
-    ["📈 Statistika",         "🗑 Oxirgi amalni o'chirish"],
-    ["🧺 Savat jami narxi"],
-    ["📅 Yilni o'zgartirish", "🗓 Oyni o'zgartirish"],
-])
-def DKB(): 
-    r=[]
-    for s in range(0,31,7): r.append([str(d) for d in range(s+1,min(s+8,32))])
-    r.append(["🔙 Orqaga"]); return kb(r)
+db_pool = None
 
-def fmt(n):
-    try: return f"{int(float(n)):,}".replace(",", " ")
-    except: return str(n)
+async def get_db():
+    return db_pool
 
-def dkey(u, day):
-    return f"{int(day):02d}.{u['month']:02d}.{u['year']}"
+async def init_db():
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            selected_year INT DEFAULT EXTRACT(YEAR FROM NOW()),
+            selected_month INT DEFAULT EXTRACT(MONTH FROM NOW()),
+            selected_date INT DEFAULT NULL
+        );
+        CREATE TABLE IF NOT EXISTS shops (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            name TEXT,
+            UNIQUE(user_id, name)
+        );
+        CREATE TABLE IF NOT EXISTS items (
+            id SERIAL PRIMARY KEY,
+            shop_id INT REFERENCES shops(id) ON DELETE CASCADE,
+            name TEXT,
+            UNIQUE(shop_id, name)
+        );
+        CREATE TABLE IF NOT EXISTS cart (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            shop_id INT REFERENCES shops(id) ON DELETE CASCADE,
+            item_id INT REFERENCES items(id) ON DELETE CASCADE,
+            year INT,
+            month INT,
+            day INT,
+            unit TEXT DEFAULT 'dona',
+            quantity FLOAT DEFAULT 1,
+            UNIQUE(user_id, item_id, year, month, day)
+        );
+        CREATE TABLE IF NOT EXISTS prices (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            shop_id INT REFERENCES shops(id) ON DELETE CASCADE,
+            item_id INT REFERENCES items(id) ON DELETE CASCADE,
+            year INT,
+            month INT,
+            day INT,
+            unit TEXT DEFAULT 'dona',
+            quantity FLOAT DEFAULT 1,
+            price_per_unit FLOAT,
+            total_price FLOAT,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+        """)
+    logger.info("✅ DB initialized")
 
-async def tmp(ctx, cid, text, d=2):
+async def ensure_user(user_id: int):
+    async with db_pool.acquire() as conn:
+        now = datetime.now()
+        await conn.execute("""
+            INSERT INTO users(user_id, selected_year, selected_month)
+            VALUES($1,$2,$3) ON CONFLICT(user_id) DO NOTHING
+        """, user_id, now.year, now.month)
+
+async def get_user(user_id: int):
+    async with db_pool.acquire() as conn:
+        return await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
+
+async def update_user(user_id: int, **kwargs):
+    for k, v in kwargs.items():
+        async with db_pool.acquire() as conn:
+            await conn.execute(f"UPDATE users SET {k}=$1 WHERE user_id=$2", v, user_id)
+
+async def delete_msg_later(context, chat_id, msg_id, delay=2):
+    await asyncio.sleep(delay)
     try:
-        m = await ctx.bot.send_message(cid, text)
-        await asyncio.sleep(d)
-        await ctx.bot.delete_message(cid, m.message_id)
-    except: pass
-
-def pdates(u): return sorted(u.get("prices", {}).keys())
-
-def last_up(u, shop, item, excl=None):
-    best_d = best_p = None
-    for d, sh in u.get("prices", {}).items():
-        if d == excl: continue
-        p = sh.get(shop, {}).get(item, {}).get("unit_price")
-        if p is not None and (best_d is None or d > best_d):
-            best_d, best_p = d, p
-    return best_p
-
-# ══════════════════════════════════════════════════════
-#  /start
-# ══════════════════════════════════════════════════════
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    data = load(); u = usr(data, update.effective_user.id); save(data)
-    ctx.user_data.clear()
-    await update.message.reply_text(
-        f"👋 Salom! Xush kelibsiz!\n📅 {MONTHS[u['month']-1]} {u['year']}",
-        reply_markup=MKB())
-    return S_MAIN
-
-# ══════════════════════════════════════════════════════
-#  MAIN
-# ══════════════════════════════════════════════════════
-async def main_h(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    t = update.message.text
-    if   t == "📋 Ro'yxat kiritish":          return await lst(update, ctx)
-    elif t == "🛒 Bozorga ro'yxat":            return await mdt(update, ctx)
-    elif t == "💰 Narxlarni kiritish":         return await pdt(update, ctx)
-    elif t == "📊 Kunlik xisobot":             return await rdt(update, ctx)
-    elif t == "📈 Statistika":                 return await stat(update, ctx)
-    elif t == "🗑 Oxirgi amalni o'chirish":    return await undo(update, ctx)
-    elif t == "🧺 Savat jami narxi":           return await bsk(update, ctx)
-    elif t == "📅 Yilni o'zgartirish":         return await cy(update, ctx)
-    elif t == "🗓 Oyni o'zgartirish":          return await cm(update, ctx)
-    return S_MAIN
-
-# ══════════════════════════════════════════════════════
-#  YIL / OY
-# ══════════════════════════════════════════════════════
-async def cy(update, ctx):
-    data = load(); u = usr(data, update.effective_user.id); yr = u["year"]
-    await update.message.reply_text(f"📅 Hozirgi yil: {yr}",
-        reply_markup=kb([[f"◀️ {yr-1}", f"✅ {yr}", f"▶️ {yr+1}"], ["🔙 Orqaga"]]))
-    return S_CY
-
-async def cy_h(update, ctx):
-    t = update.message.text; uid = str(update.effective_user.id)
-    if t == "🔙 Orqaga":
-        await update.message.reply_text("🏠 Asosiy menyu", reply_markup=MKB()); return S_MAIN
-    data = load(); u = usr(data, uid); yr = u["year"]
-    if f"◀️ {yr-1}" in t: u["year"] = yr-1
-    elif f"▶️ {yr+1}" in t: u["year"] = yr+1
-    save(data)
-    await tmp(ctx, update.effective_chat.id, f"✅ Yil → {u['year']}")
-    await update.message.reply_text(f"📅 {MONTHS[u['month']-1]} {u['year']}", reply_markup=MKB())
-    return S_MAIN
-
-async def cm(update, ctx):
-    r = [[f"{ME[i]} {MONTHS[i]}" for i in range(j,j+3)] for j in range(0,12,3)]
-    r.append(["🔙 Orqaga"])
-    await update.message.reply_text("🗓 Oyni tanlang:", reply_markup=kb(r)); return S_CM
-
-async def cm_h(update, ctx):
-    t = update.message.text; uid = str(update.effective_user.id)
-    if t == "🔙 Orqaga":
-        await update.message.reply_text("🏠 Asosiy menyu", reply_markup=MKB()); return S_MAIN
-    for i, m in enumerate(MONTHS):
-        if m in t:
-            data = load(); u = usr(data, uid); u["month"] = i+1; save(data)
-            await tmp(ctx, update.effective_chat.id, f"✅ Oy → {m}")
-            await update.message.reply_text(f"📅 {m} {u['year']}", reply_markup=MKB())
-            return S_MAIN
-    r = [[f"{ME[i]} {MONTHS[i]}" for i in range(j,j+3)] for j in range(0,12,3)]
-    r.append(["🔙 Orqaga"])
-    await update.message.reply_text("🗓 Oyni tanlang:", reply_markup=kb(r)); return S_CM
-
-# ══════════════════════════════════════════════════════
-#  RO'YXAT KIRITISH
-# ══════════════════════════════════════════════════════
-async def lst(update, ctx):
-    data = load(); u = usr(data, str(update.effective_user.id))
-    shops = list(u["shops"].keys())
-    r = [[f"🏪 {s}"] for s in shops]
-    r += [["➕ Do'kon qo'shish","🗑 Do'kon o'chirish"],["🔙 Orqaga"]]
-    await update.message.reply_text("🏪 Do'konlar:", reply_markup=kb(r)); return S_LST
-
-async def lst_h(update, ctx):
-    t = update.message.text; uid = str(update.effective_user.id)
-    data = load(); u = usr(data, uid)
-    if t == "🔙 Orqaga":
-        await update.message.reply_text("🏠 Asosiy menyu", reply_markup=MKB()); return S_MAIN
-    if t == "➕ Do'kon qo'shish":
-        await update.message.reply_text("🏪 Yangi do'kon nomini kiriting:"); return S_AS
-    if t == "🗑 Do'kon o'chirish":
-        shops = list(u["shops"].keys())
-        if not shops:
-            await tmp(ctx, update.effective_chat.id, "⚠️ Do'konlar yo'q!")
-            return await lst(update, ctx)
-        r = [[f"❌ {s}"] for s in shops]+[["🔙 Orqaga"]]
-        await update.message.reply_text("O'chiriladigan do'konni tanlang:", reply_markup=kb(r)); return S_DS
-    shop = t.replace("🏪 ","")
-    if shop in u["shops"]:
-        ctx.user_data["shop"] = shop; return await shmenu(update, ctx, shop)
-    return S_LST
-
-async def as_h(update, ctx):
-    t = update.message.text.strip(); uid = str(update.effective_user.id)
-    if t == "🔙 Orqaga": return await lst(update, ctx)
-    data = load(); u = usr(data, uid)
-    if t not in u["shops"]:
-        u["shops"][t] = []; save(data)
-        await tmp(ctx, update.effective_chat.id, f"✅ '{t}' qo'shildi!")
-    else:
-        await tmp(ctx, update.effective_chat.id, "⚠️ Allaqachon bor!")
-    return await lst(update, ctx)
-
-async def ds_h(update, ctx):
-    t = update.message.text; uid = str(update.effective_user.id)
-    if t == "🔙 Orqaga": return await lst(update, ctx)
-    shop = t.replace("❌ ","")
-    data = load(); u = usr(data, uid)
-    if shop in u["shops"]:
-        del u["shops"][shop]; save(data)
-        await tmp(ctx, update.effective_chat.id, f"✅ '{shop}' o'chirildi!")
-    return await lst(update, ctx)
-
-async def shmenu(update, ctx, shop=None):
-    if shop is None: shop = ctx.user_data.get("shop","")
-    data = load(); u = usr(data, str(update.effective_user.id))
-    items = u["shops"].get(shop, [])
-    r = [[f"📦 {it}"] for it in items]
-    r += [["➕ Tovar qo'shish","🗑 Tovarni o'chirish"],["🔙 Orqaga"]]
-    await update.message.reply_text(f"🏪 {shop}\n📦 Tovarlar:", reply_markup=kb(r)); return S_SH
-
-async def sh_h(update, ctx):
-    t = update.message.text; shop = ctx.user_data.get("shop","")
-    uid = str(update.effective_user.id); data = load(); u = usr(data, uid)
-    if t == "🔙 Orqaga": return await lst(update, ctx)
-    if t == "➕ Tovar qo'shish":
-        await update.message.reply_text(f"📦 '{shop}' uchun tovar nomini kiriting:"); return S_AI
-    if t == "🗑 Tovarni o'chirish":
-        items = u["shops"].get(shop, [])
-        if not items:
-            await tmp(ctx, update.effective_chat.id, "⚠️ Tovarlar yo'q!")
-            return await shmenu(update, ctx, shop)
-        r = [[f"❌ {it}"] for it in items]+[["🔙 Orqaga"]]
-        await update.message.reply_text("O'chiriladigan tovarni tanlang:", reply_markup=kb(r)); return S_DI
-    return S_SH
-
-async def ai_h(update, ctx):
-    t = update.message.text.strip(); uid = str(update.effective_user.id)
-    shop = ctx.user_data.get("shop","")
-    if t == "🔙 Orqaga": return await shmenu(update, ctx, shop)
-    data = load(); u = usr(data, uid)
-    if t not in u["shops"].get(shop, []):
-        u["shops"].setdefault(shop,[]).append(t); save(data)
-        await tmp(ctx, update.effective_chat.id, f"✅ '{t}' qo'shildi!")
-    else:
-        await tmp(ctx, update.effective_chat.id, "⚠️ Allaqachon bor!")
-    return await shmenu(update, ctx, shop)
-
-async def di_h(update, ctx):
-    t = update.message.text; uid = str(update.effective_user.id)
-    shop = ctx.user_data.get("shop","")
-    if t == "🔙 Orqaga": return await shmenu(update, ctx, shop)
-    item = t.replace("❌ ","")
-    data = load(); u = usr(data, uid)
-    if item in u["shops"].get(shop, []):
-        u["shops"][shop].remove(item); save(data)
-        await tmp(ctx, update.effective_chat.id, f"✅ '{item}' o'chirildi!")
-    return await shmenu(update, ctx, shop)
-
-# ══════════════════════════════════════════════════════
-#  BOZORGA RO'YXAT
-# ══════════════════════════════════════════════════════
-async def mdt(update, ctx):
-    await update.message.reply_text("📅 Sanani tanlang (kun):", reply_markup=DKB()); return S_MD
-
-async def md_h(update, ctx):
-    t = update.message.text
-    if t == "🔙 Orqaga":
-        await update.message.reply_text("🏠 Asosiy menyu", reply_markup=MKB()); return S_MAIN
-    try:
-        day = int(t)
-        if 1 <= day <= 31:
-            ctx.user_data["md"] = day; return await mshops(update, ctx)
-    except: pass
-    await update.message.reply_text("Kun raqamini tanlang:", reply_markup=DKB()); return S_MD
-
-async def mshops(update, ctx):
-    uid = str(update.effective_user.id); data = load(); u = usr(data, uid)
-    day = ctx.user_data["md"]; d = dkey(u, day)
-    shops = list(u["shops"].keys())
-    cart = u.get("cart", {}).get(d, {})
-    summ = ""
-    if cart:
-        summ = "\n\n🧺 Savat:\n"
-        for sh, items in cart.items():
-            if items:
-                summ += f"  🏪 {sh}:\n"
-                for it, inf in items.items():
-                    summ += f"    • {it}: {inf['qty']} {inf['unit']}\n"
-    r = [[f"🏪 {s}"] for s in shops]
-    r += [["🗑 Savatdan o'chirish"],["🔙 Orqaga"]]
-    await update.message.reply_text(f"🛒 Bozorga ro'yxat | 📅 {d}{summ}\n\nDo'konni tanlang:", reply_markup=kb(r))
-    return S_MSH
-
-async def msh_h(update, ctx):
-    t = update.message.text; uid = str(update.effective_user.id)
-    data = load(); u = usr(data, uid)
-    day = ctx.user_data.get("md"); d = dkey(u, day)
-    if t == "🔙 Orqaga": return await mdt(update, ctx)
-    if t == "🗑 Savatdan o'chirish":
-        cart = u.get("cart", {}).get(d, {})
-        all_i = [(sh, it) for sh, items in cart.items() for it in items]
-        if not all_i:
-            await tmp(ctx, update.effective_chat.id, "⚠️ Savat bo'sh!")
-            return await mshops(update, ctx)
-        r = [[f"❌ {sh} | {it}"] for sh, it in all_i]+[["🔙 Orqaga"]]
-        await update.message.reply_text("Savatdan o'chiriladigan tovarni tanlang:", reply_markup=kb(r)); return S_MDL
-    shop = t.replace("🏪 ","")
-    if shop in u["shops"]:
-        ctx.user_data["msh"] = shop; return await mitems(update, ctx)
-    return S_MSH
-
-async def mitems(update, ctx):
-    uid = str(update.effective_user.id); data = load(); u = usr(data, uid)
-    day = ctx.user_data["md"]; shop = ctx.user_data["msh"]; d = dkey(u, day)
-    items = u["shops"].get(shop, [])
-    cart_i = u.get("cart", {}).get(d, {}).get(shop, {})
-    r = []
-    for it in items:
-        mark = "✅ " if it in cart_i else ""
-        r.append([f"{mark}{it}"])
-    r += [["➕ Tovar qo'shish"],["🔙 Orqaga"]]
-    await update.message.reply_text(f"🏪 {shop}\nNima xarid qilmoqchisiz?", reply_markup=kb(r))
-    return S_MI
-
-async def mi_h(update, ctx):
-    t = update.message.text; uid = str(update.effective_user.id)
-    data = load(); u = usr(data, uid)
-    shop = ctx.user_data.get("msh",""); day = ctx.user_data.get("md"); d = dkey(u, day)
-    if t == "🔙 Orqaga": return await mshops(update, ctx)
-    if t == "➕ Tovar qo'shish":
-        await update.message.reply_text(f"📦 {shop} dan nima olmoqchisiz?"); return S_MAI
-    item = t.replace("✅ ","").strip()
-    ctx.user_data["mi"] = item
-    await update.message.reply_text(f"📦 {item}\nQancha?", reply_markup=kb([["⚖️ kg","🔢 dona"],["🔙 Orqaga"]]))
-    return S_MU
-
-async def mai_h(update, ctx):
-    t = update.message.text.strip()
-    if t == "🔙 Orqaga": return await mitems(update, ctx)
-    ctx.user_data["mi"] = t
-    await update.message.reply_text(f"📦 {t}\nQancha?", reply_markup=kb([["⚖️ kg","🔢 dona"],["🔙 Orqaga"]]))
-    return S_MU
-
-async def mu_h(update, ctx):
-    t = update.message.text; item = ctx.user_data.get("mi","")
-    if t == "🔙 Orqaga": return await mitems(update, ctx)
-    if t == "⚖️ kg":
-        ctx.user_data["mu"] = "kg"; ctx.user_data["mq"] = 0.5
-        await update.message.reply_text(f"⚖️ {item}\nHozir: 0.5 kg",
-            reply_markup=kb([["➖0.5","0.5 kg","➕0.5"],["➖10","10 kg","➕10"],["✅ Saqlash","🔙 Orqaga"]]))
-        return S_MQ
-    if t == "🔢 dona":
-        ctx.user_data["mu"] = "dona"; ctx.user_data["mq"] = 1
-        await update.message.reply_text(f"🔢 {item}\nHozir: 1 dona",
-            reply_markup=kb([["➖1","1 dona","➕1"],["✅ Saqlash","🔙 Orqaga"]]))
-        return S_MQ
-    return S_MU
-
-async def mq_h(update, ctx):
-    t = update.message.text; uid = str(update.effective_user.id)
-    item = ctx.user_data.get("mi",""); shop = ctx.user_data.get("msh","")
-    unit = ctx.user_data.get("mu","dona"); qty = ctx.user_data.get("mq", 1)
-    day = ctx.user_data.get("md")
-    if t == "🔙 Orqaga": return await mitems(update, ctx)
-    if unit == "kg":
-        if   t == "0.5 kg": qty = 0.5
-        elif t == "10 kg":  qty = 10.0
-        elif t == "➕0.5":  qty = round(qty+0.5,1)
-        elif t == "➖0.5":  qty = max(0.5,round(qty-0.5,1))
-        elif t == "➕10":   qty = round(qty+10,1)
-        elif t == "➖10":   qty = max(0.5,round(qty-10,1))
-    else:
-        if   t == "1 dona": qty = 1
-        elif t == "➕1":    qty = qty+1
-        elif t == "➖1":    qty = max(1,qty-1)
-    ctx.user_data["mq"] = qty
-    if t == "✅ Saqlash":
-        data = load(); u = usr(data, uid); d = dkey(u, day)
-        u.setdefault("cart",{}).setdefault(d,{}).setdefault(shop,{})[item] = {"qty":qty,"unit":unit}
-        save(data)
-        await tmp(ctx, update.effective_chat.id, f"✅ {item} — {qty} {unit} savatga qo'shildi!")
-        return await mitems(update, ctx)
-    if unit == "kg":
-        await update.message.reply_text(f"⚖️ {item}: {qty} kg",
-            reply_markup=kb([["➖0.5","0.5 kg","➕0.5"],["➖10","10 kg","➕10"],["✅ Saqlash","🔙 Orqaga"]]))
-    else:
-        await update.message.reply_text(f"🔢 {item}: {qty} dona",
-            reply_markup=kb([["➖1","1 dona","➕1"],["✅ Saqlash","🔙 Orqaga"]]))
-    return S_MQ
-
-async def mdl_h(update, ctx):
-    t = update.message.text; uid = str(update.effective_user.id)
-    if t == "🔙 Orqaga": return await mshops(update, ctx)
-    entry = t.replace("❌ ","")
-    if " | " in entry:
-        sh, it = entry.split(" | ",1)
-        data = load(); u = usr(data, uid); day = ctx.user_data.get("md"); d = dkey(u, day)
-        cart = u.get("cart",{})
-        if d in cart and sh in cart[d] and it in cart[d][sh]:
-            del cart[d][sh][it]; save(data)
-            await tmp(ctx, update.effective_chat.id, f"✅ '{it}' savatdan o'chirildi!")
-    return await mshops(update, ctx)
-
-# ══════════════════════════════════════════════════════
-#  NARXLARNI KIRITISH
-# ══════════════════════════════════════════════════════
-async def pdt(update, ctx):
-    await update.message.reply_text("📅 Narx kiritiladigan sanani tanlang:", reply_markup=DKB()); return S_PD
-
-async def pd_h(update, ctx):
-    t = update.message.text
-    if t == "🔙 Orqaga":
-        await update.message.reply_text("🏠 Asosiy menyu", reply_markup=MKB()); return S_MAIN
-    try:
-        day = int(t)
-        if 1 <= day <= 31:
-            ctx.user_data["pd"] = day; return await pshops(update, ctx)
-    except: pass
-    await update.message.reply_text("Kun raqamini tanlang:", reply_markup=DKB()); return S_PD
-
-async def pshops(update, ctx):
-    uid = str(update.effective_user.id); data = load(); u = usr(data, uid)
-    day = ctx.user_data["pd"]; d = dkey(u, day)
-    cart = u.get("cart",{}).get(d,{})
-    if not cart:
-        await tmp(ctx, update.effective_chat.id, f"⚠️ {d} da savat bo'sh! Avval bozorga ro'yxat qo'shing.")
-        await update.message.reply_text("🏠 Asosiy menyu", reply_markup=MKB()); return S_MAIN
-    r = [[f"🏪 {sh}"] for sh in cart]+[["🔙 Orqaga"]]
-    await update.message.reply_text(f"💰 Narx kiritish | 📅 {d}\nDo'konni tanlang:", reply_markup=kb(r)); return S_PSH
-
-async def psh_h(update, ctx):
-    t = update.message.text; uid = str(update.effective_user.id)
-    data = load(); u = usr(data, uid); day = ctx.user_data.get("pd"); d = dkey(u, day)
-    if t == "🔙 Orqaga": return await pdt(update, ctx)
-    shop = t.replace("🏪 ","")
-    if shop in u.get("cart",{}).get(d,{}):
-        ctx.user_data["psh"] = shop; return await pitems(update, ctx)
-    return S_PSH
-
-async def pitems(update, ctx):
-    uid = str(update.effective_user.id); data = load(); u = usr(data, uid)
-    day = ctx.user_data["pd"]; shop = ctx.user_data["psh"]; d = dkey(u, day)
-    cart_i = u.get("cart",{}).get(d,{}).get(shop,{})
-    price_i = u.get("prices",{}).get(d,{}).get(shop,{})
-    r = []
-    for it, inf in cart_i.items():
-        done = "✅ " if it in price_i else ""
-        r.append([f"{done}{it} ({inf['qty']} {inf['unit']})"])
-    r.append(["🔙 Orqaga"])
-    await update.message.reply_text(f"💰 {shop} | 📅 {d}\nTovarni tanlang:", reply_markup=kb(r)); return S_PI
-
-async def pi_h(update, ctx):
-    t = update.message.text; uid = str(update.effective_user.id)
-    data = load(); u = usr(data, uid)
-    day = ctx.user_data.get("pd"); shop = ctx.user_data.get("psh"); d = dkey(u, day)
-    if t == "🔙 Orqaga": return await pshops(update, ctx)
-    raw = t.replace("✅ ","").strip(); item = raw.split(" (")[0].strip()
-    cart_i = u.get("cart",{}).get(d,{}).get(shop,{})
-    if item in cart_i:
-        inf = cart_i[item]
-        ctx.user_data["pi"] = item; ctx.user_data["pq"] = inf["qty"]; ctx.user_data["pu"] = inf["unit"]
-        lp = last_up(u, shop, item, excl=d)
-        lp_t = f"\n⬇️ Oxirgi narx: {fmt(lp)} so'm" if lp else ""
-        await update.message.reply_text(
-            f"💰 {item} — {inf['qty']} {inf['unit']} oldingiz\n1 {inf['unit']} narxini kiriting (faqat raqam):{lp_t}",
-            reply_markup=kb([["💱 kg/dona o'zgartirish"],["🔙 Orqaga"]]))
-        return S_PE
-    return S_PI
-
-async def pe_h(update, ctx):
-    t = update.message.text.strip(); uid = str(update.effective_user.id)
-    data = load(); u = usr(data, uid)
-    day = ctx.user_data.get("pd"); shop = ctx.user_data.get("psh")
-    item = ctx.user_data.get("pi"); qty = ctx.user_data.get("pq",1); unit = ctx.user_data.get("pu","dona")
-    d = dkey(u, day)
-    if t == "🔙 Orqaga": return await pitems(update, ctx)
-    if t == "💱 kg/dona o'zgartirish":
-        await update.message.reply_text("Birlikni tanlang:", reply_markup=kb([["⚖️ kg","🔢 dona"],["🔙 Orqaga"]])); return S_PCU
-    try:
-        price = float(t.replace(" ","").replace(",","."))
-        total = price * qty
-        u.setdefault("prices",{}).setdefault(d,{}).setdefault(shop,{})[item] = {
-            "qty":qty,"unit":unit,"unit_price":price,"total":total}
-        save(data)
-        await tmp(ctx, update.effective_chat.id, f"✅ {item}: {qty} {unit} × {fmt(price)} = {fmt(total)} so'm saqlandi!")
-        return await pitems(update, ctx)
+        await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
     except:
-        lp = last_up(u, shop, item, excl=d)
-        lp_t = f"\n⬇️ Oxirgi narx: {fmt(lp)} so'm" if lp else ""
-        await update.message.reply_text(
-            f"⚠️ Faqat raqam kiriting!\n{item} narxini kiriting:{lp_t}",
-            reply_markup=kb([["💱 kg/dona o'zgartirish"],["🔙 Orqaga"]])); return S_PE
+        pass
 
-async def pcu_h(update, ctx):
-    t = update.message.text; item = ctx.user_data.get("pi","")
-    qty = ctx.user_data.get("pq",1)
-    if t == "🔙 Orqaga": return await pitems(update, ctx)
-    if t == "⚖️ kg":
-        ctx.user_data["pu"] = "kg"; ctx.user_data["pq"] = float(qty) if qty else 1.0
-        await update.message.reply_text(f"⚖️ {item} — kg tanlang:",
-            reply_markup=kb([["➖0.5","0.5 kg","➕0.5"],["➖10","10 kg","➕10"],["✅ Tasdiqlash","🔙 Orqaga"]])); return S_PKG
-    if t == "🔢 dona":
-        ctx.user_data["pu"] = "dona"; ctx.user_data["pq"] = int(qty) if qty else 1
-        await update.message.reply_text(f"🔢 {item} — dona tanlang:",
-            reply_markup=kb([["➖1","1 dona","➕1"],["✅ Tasdiqlash","🔙 Orqaga"]])); return S_PDN
-    return S_PCU
+def main_menu_keyboard():
+    return ReplyKeyboardMarkup([
+        ["🛒 Ro'yxat kiritish", "🏪 Bozorga ro'yxat"],
+        ["💰 Narxlarni kiritish", "📊 Kunlik hisobot"],
+        ["📈 Statistika", "🗑 Oxirgi amalni o'chirish"],
+        ["💼 Savat jami narxi"],
+        ["📅 Yilni o'zgartirish", "🗓 Oyni o'zgartirish"]
+    ], resize_keyboard=True)
 
-async def pkg_h(update, ctx):
-    t = update.message.text; uid = str(update.effective_user.id)
-    item = ctx.user_data.get("pi",""); shop = ctx.user_data.get("psh","")
-    qty = ctx.user_data.get("pq",0.5); day = ctx.user_data.get("pd")
-    if t == "🔙 Orqaga": return await pitems(update, ctx)
-    if   t == "0.5 kg":  qty = 0.5
-    elif t == "10 kg":   qty = 10.0
-    elif t == "➕0.5":   qty = round(qty+0.5,1)
-    elif t == "➖0.5":   qty = max(0.5,round(qty-0.5,1))
-    elif t == "➕10":    qty = round(qty+10,1)
-    elif t == "➖10":    qty = max(0.5,round(qty-10,1))
-    ctx.user_data["pq"] = qty
-    if t == "✅ Tasdiqlash":
-        data = load(); u = usr(data, uid); d = dkey(u, day)
-        c = u.setdefault("cart",{}).setdefault(d,{}).setdefault(shop,{})
-        if item in c: c[item]["qty"]=qty; c[item]["unit"]="kg"
-        save(data)
-        lp = last_up(u,shop,item,d); lp_t = f"\n⬇️ Oxirgi narx: {fmt(lp)} so'm" if lp else ""
-        await update.message.reply_text(
-            f"💰 {item} — {qty} kg\n1 kg narxini kiriting:{lp_t}",
-            reply_markup=kb([["💱 kg/dona o'zgartirish"],["🔙 Orqaga"]])); return S_PE
-    await update.message.reply_text(f"⚖️ {item}: {qty} kg",
-        reply_markup=kb([["➖0.5","0.5 kg","➕0.5"],["➖10","10 kg","➕10"],["✅ Tasdiqlash","🔙 Orqaga"]])); return S_PKG
+def back_keyboard():
+    return ReplyKeyboardMarkup([["⬅️ Orqaga"]], resize_keyboard=True)
 
-async def pdn_h(update, ctx):
-    t = update.message.text; uid = str(update.effective_user.id)
-    item = ctx.user_data.get("pi",""); shop = ctx.user_data.get("psh","")
-    qty = ctx.user_data.get("pq",1); day = ctx.user_data.get("pd")
-    if t == "🔙 Orqaga": return await pitems(update, ctx)
-    if   t == "1 dona":  qty = 1
-    elif t == "➕1":     qty = qty+1
-    elif t == "➖1":     qty = max(1,qty-1)
-    ctx.user_data["pq"] = qty
-    if t == "✅ Tasdiqlash":
-        data = load(); u = usr(data, uid); d = dkey(u, day)
-        c = u.setdefault("cart",{}).setdefault(d,{}).setdefault(shop,{})
-        if item in c: c[item]["qty"]=qty; c[item]["unit"]="dona"
-        save(data)
-        lp = last_up(u,shop,item,d); lp_t = f"\n⬇️ Oxirgi narx: {fmt(lp)} so'm" if lp else ""
-        await update.message.reply_text(
-            f"💰 {item} — {qty} dona\n1 dona narxini kiriting:{lp_t}",
-            reply_markup=kb([["💱 kg/dona o'zgartirish"],["🔙 Orqaga"]])); return S_PE
-    await update.message.reply_text(f"🔢 {item}: {qty} dona",
-        reply_markup=kb([["➖1","1 dona","➕1"],["✅ Tasdiqlash","🔙 Orqaga"]])); return S_PDN
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    await ensure_user(user_id)
+    user = await get_user(user_id)
+    year = user['selected_year']
+    month = MONTHS[user['selected_month']-1]
+    await update.message.reply_text(
+        f"👋 Xush kelibsiz!\n📅 Tanlangan: {month} {year}",
+        reply_markup=main_menu_keyboard()
+    )
+    return MAIN_MENU
 
-# ══════════════════════════════════════════════════════
-#  KUNLIK XISOBOT
-# ══════════════════════════════════════════════════════
-async def rdt(update, ctx):
-    uid = str(update.effective_user.id); data = load(); u = usr(data, uid)
-    dates = pdates(u)
-    if not dates:
-        await tmp(ctx, update.effective_chat.id, "⚠️ Hech qanday narx kiritilmagan!")
-        await update.message.reply_text("🏠 Asosiy menyu", reply_markup=MKB()); return S_MAIN
-    r = [[d] for d in dates]+[["🔙 Orqaga"]]
-    await update.message.reply_text("📊 Xisobot sanasini tanlang:", reply_markup=kb(r)); return S_RD
+# =================== YEAR/MONTH CHANGE ===================
 
-async def rd_h(update, ctx):
-    t = update.message.text; uid = str(update.effective_user.id)
-    if t == "🔙 Orqaga":
-        await update.message.reply_text("🏠 Asosiy menyu", reply_markup=MKB()); return S_MAIN
-    data = load(); u = usr(data, uid)
-    if t in u.get("prices",{}):
-        prices = u["prices"][t]; grand = 0
-        txt = f"📊 {t} Xisobot\n{'─'*30}\n"
-        for shop, items in prices.items():
-            txt += f"\n🏪 {shop}:\n"; sh_t = 0
-            for it, inf in items.items():
-                total = inf.get("total",0); sh_t += total
-                txt += f"  • {it}: {fmt(total)} so'm ({inf['qty']} {inf['unit']})\n"
-            txt += f"  📌 {shop} jami: {fmt(sh_t)} so'm\n"; grand += sh_t
-        txt += f"\n{'─'*30}\n💰 Umumiy jami: {fmt(grand)} so'm"
-        dates = pdates(u); r = [[d] for d in dates]+[["🔙 Orqaga"]]
-        await update.message.reply_text(txt, reply_markup=kb(r))
-    return S_RD
+async def change_year(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = await get_user(update.effective_user.id)
+    cur = user['selected_year']
+    kb = ReplyKeyboardMarkup([
+        [f"◀️ {cur-1}", f"✅ {cur} (hozir)", f"▶️ {cur+1}"],
+        ["⬅️ Orqaga"]
+    ], resize_keyboard=True)
+    await update.message.reply_text(f"📅 Yilni tanlang (hozir: {cur}):", reply_markup=kb)
+    return CHANGE_YEAR
 
-# ══════════════════════════════════════════════════════
-#  STATISTIKA
-# ══════════════════════════════════════════════════════
-async def stat(update, ctx):
-    uid = str(update.effective_user.id); data = load(); u = usr(data, uid)
-    dates = pdates(u)
-    if not dates:
-        await tmp(ctx, update.effective_chat.id, "⚠️ Statistika uchun ma'lumot yo'q!")
-        await update.message.reply_text("🏠 Asosiy menyu", reply_markup=MKB()); return S_MAIN
-    cur = dates[-1]; prevs = dates[:-1][-2:]; prices = u.get("prices",{})
-    current = prices.get(cur,{}); risen = []; fallen = []
-    txt = f"📈 Statistika | 📅 {cur}\n{'─'*30}\n"
-    for shop, items in current.items():
-        txt += f"\n🏪 {shop}:\n"
-        for it, inf in items.items():
-            cp = inf.get("unit_price",0)
-            pl = [(pd, prices.get(pd,{}).get(shop,{}).get(it,{}).get("unit_price",0))
-                  for pd in prevs if prices.get(pd,{}).get(shop,{}).get(it)]
-            if not pl: icon = "🆕"
-            elif any(cp > p for _,p in pl): icon = "❌↗️"; risen.append(it)
-            elif any(cp < p for _,p in pl): icon = "⭕️↘️"; fallen.append(it)
-            else: icon = "✅"
-            pt = " / ".join(f"{pd}-{fmt(p)} so'm" for pd,p in pl)
-            txt += f"  • {it}: {icon} ({fmt(cp)} so'm)"
-            if pt: txt += f" / ({pt})"
-            txt += "\n"
-    if risen:  txt += f"\n{'─'*30}\n❌↗️ Oshgan: {', '.join(risen)}"
-    if fallen: txt += f"\n⭕️↘️ Tushgan: {', '.join(fallen)}"
-    await update.message.reply_text(txt, reply_markup=kb([["🔙 Orqaga"]])); return S_ST
+async def handle_change_year(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    user_id = update.effective_user.id
+    if text == "⬅️ Orqaga":
+        return await go_main(update, context)
+    user = await get_user(user_id)
+    cur = user['selected_year']
+    if f"◀️ {cur-1}" in text:
+        new_year = cur - 1
+    elif f"▶️ {cur+1}" in text:
+        new_year = cur + 1
+    else:
+        new_year = cur
+    await update_user(user_id, selected_year=new_year)
+    m = await update.message.reply_text(f"✅ {new_year} yil tanlandi!")
+    asyncio.create_task(delete_msg_later(context, update.effective_chat.id, m.message_id))
+    return await go_main(update, context)
 
-async def st_h(update, ctx):
-    if update.message.text == "🔙 Orqaga":
-        await update.message.reply_text("🏠 Asosiy menyu", reply_markup=MKB()); return S_MAIN
-    return S_ST
+async def change_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = []
+    row = []
+    for i, m in enumerate(MONTHS):
+        row.append(m)
+        if len(row) == 3:
+            kb.append(row)
+            row = []
+    if row:
+        kb.append(row)
+    kb.append(["⬅️ Orqaga"])
+    await update.message.reply_text("🗓 Oyni tanlang:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+    return CHANGE_MONTH
 
-# ══════════════════════════════════════════════════════
-#  OXIRGI AMALNI O'CHIRISH
-# ══════════════════════════════════════════════════════
-async def undo(update, ctx):
-    uid = str(update.effective_user.id); data = load(); u = usr(data, uid)
-    dates = pdates(u)
-    if not dates:
-        await tmp(ctx, update.effective_chat.id, "⚠️ O'chiriladigan narsa yo'q!")
-        await update.message.reply_text("🏠 Asosiy menyu", reply_markup=MKB()); return S_MAIN
-    r = [[d] for d in dates]+[["🔙 Orqaga"]]
-    await update.message.reply_text("🗑 Qaysi sanani tanlaysiz?", reply_markup=kb(r)); return S_UD
+async def handle_change_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    user_id = update.effective_user.id
+    if text == "⬅️ Orqaga":
+        return await go_main(update, context)
+    if text in MONTHS:
+        month_num = MONTHS.index(text) + 1
+        await update_user(user_id, selected_month=month_num)
+        m = await update.message.reply_text(f"✅ {text} oyi tanlandi!")
+        asyncio.create_task(delete_msg_later(context, update.effective_chat.id, m.message_id))
+    return await go_main(update, context)
 
-async def ud_h(update, ctx):
-    t = update.message.text; uid = str(update.effective_user.id)
-    if t == "🔙 Orqaga":
-        await update.message.reply_text("🏠 Asosiy menyu", reply_markup=MKB()); return S_MAIN
-    data = load(); u = usr(data, uid); prices = u.get("prices",{})
-    if t in prices:
-        last_sh = last_it = None
-        for sh, items in prices[t].items():
-            for it in items: last_sh, last_it = sh, it
-        if last_it:
-            del prices[t][last_sh][last_it]
-            if not prices[t][last_sh]: del prices[t][last_sh]
-            if not prices[t]: del prices[t]
-            save(data)
-            await tmp(ctx, update.effective_chat.id, f"✅ '{last_it}' ({last_sh}) o'chirildi!")
-        else:
-            await tmp(ctx, update.effective_chat.id, "⚠️ Bu sanada tovar topilmadi!")
-    return await undo(update, ctx)
+async def go_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = await get_user(update.effective_user.id)
+    year = user['selected_year']
+    month = MONTHS[user['selected_month']-1]
+    await update.message.reply_text(
+        f"🏠 Asosiy menu\n📅 {month} {year}",
+        reply_markup=main_menu_keyboard()
+    )
+    return MAIN_MENU
 
-# ══════════════════════════════════════════════════════
-#  SAVAT JAMI NARXI
-# ══════════════════════════════════════════════════════
-async def bsk(update, ctx):
-    await update.message.reply_text("🧺 Savat jami uchun sanani tanlang:", reply_markup=DKB()); return S_BD
+# =================== RO'YXAT KIRITISH ===================
 
-async def bd_h(update, ctx):
-    t = update.message.text; uid = str(update.effective_user.id)
-    if t == "🔙 Orqaga":
-        await update.message.reply_text("🏠 Asosiy menyu", reply_markup=MKB()); return S_MAIN
+async def royxat_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    async with db_pool.acquire() as conn:
+        shops = await conn.fetch("SELECT * FROM shops WHERE user_id=$1 ORDER BY name", user_id)
+    btns = []
+    for s in shops:
+        btns.append([s['name']])
+    btns.append(["➕ Do'kon qo'shish", "🗑 Do'kon o'chirish"])
+    btns.append(["⬅️ Orqaga"])
+    await update.message.reply_text(
+        "🏪 Do'konlar ro'yxati:",
+        reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True)
+    )
+    context.user_data['in_royxat'] = True
+    return SHOP_MENU
+
+async def shop_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    user_id = update.effective_user.id
+    if text == "⬅️ Orqaga":
+        context.user_data.pop('in_royxat', None)
+        return await go_main(update, context)
+    if text == "➕ Do'kon qo'shish":
+        await update.message.reply_text("🏪 Do'kon nomini kiriting:", reply_markup=back_keyboard())
+        return ADD_SHOP
+    if text == "🗑 Do'kon o'chirish":
+        async with db_pool.acquire() as conn:
+            shops = await conn.fetch("SELECT * FROM shops WHERE user_id=$1", user_id)
+        if not shops:
+            await update.message.reply_text("❌ Do'konlar yo'q!")
+            return SHOP_MENU
+        btns = [[s['name']] for s in shops]
+        btns.append(["⬅️ Orqaga"])
+        await update.message.reply_text("🗑 Qaysi do'konni o'chirmoqchisiz?",
+            reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True))
+        return DELETE_SHOP
+    # Shop selected
+    async with db_pool.acquire() as conn:
+        shop = await conn.fetchrow("SELECT * FROM shops WHERE user_id=$1 AND name=$2", user_id, text)
+    if shop:
+        context.user_data['current_shop_id'] = shop['id']
+        context.user_data['current_shop_name'] = shop['name']
+        return await show_shop_items(update, context, shop['id'], shop['name'])
+    return SHOP_MENU
+
+async def add_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    user_id = update.effective_user.id
+    if text == "⬅️ Orqaga":
+        return await royxat_menu(update, context)
     try:
-        day = int(t)
-        if 1 <= day <= 31:
-            data = load(); u = usr(data, uid); d = dkey(u, day)
-            cart = u.get("cart",{}).get(d,{})
-            if not cart:
-                await tmp(ctx, update.effective_chat.id, f"⚠️ {d} da savat bo'sh!")
-                await update.message.reply_text("🏠 Asosiy menyu", reply_markup=MKB()); return S_MAIN
-            pr_d = u.get("prices",{}).get(d,{}); grand = 0
-            txt = f"🧺 Savat jami | 📅 {d}\n{'─'*30}\n"
-            for shop, items in cart.items():
-                txt += f"\n🏪 {shop}:\n"; sh_t = 0
-                for it, inf in items.items():
-                    pi = pr_d.get(shop,{}).get(it)
-                    lp = pi.get("total",0) if pi else None
-                    if lp is None:
-                        up = last_up(u,shop,it)
-                        if up: lp = up*inf["qty"]
-                    if lp is not None:
-                        txt += f"  • {it}: ~{fmt(lp)} so'm ({inf['qty']} {inf['unit']})\n"; sh_t += lp
-                    else:
-                        txt += f"  • {it}: narx yo'q ({inf['qty']} {inf['unit']})\n"
-                txt += f"  📌 ~{shop} jami: {fmt(sh_t)} so'm\n"; grand += sh_t
-            txt += f"\n{'─'*30}\n💰 Umumiy ~jami: {fmt(grand)} so'm"
-            await update.message.reply_text(txt, reply_markup=kb([["🔙 Orqaga"]])); return S_BD
-    except: pass
-    await update.message.reply_text("Kun raqamini tanlang:", reply_markup=DKB()); return S_BD
+        async with db_pool.acquire() as conn:
+            await conn.execute("INSERT INTO shops(user_id,name) VALUES($1,$2)", user_id, text)
+        m = await update.message.reply_text(f"✅ '{text}' do'koni qo'shildi!")
+        asyncio.create_task(delete_msg_later(context, update.effective_chat.id, m.message_id))
+    except:
+        m = await update.message.reply_text("❌ Bu do'kon allaqachon mavjud!")
+        asyncio.create_task(delete_msg_later(context, update.effective_chat.id, m.message_id))
+    return await royxat_menu(update, context)
 
-async def bd_back(update, ctx):
-    if update.message.text == "🔙 Orqaga":
-        await update.message.reply_text("🏠 Asosiy menyu", reply_markup=MKB()); return S_MAIN
-    return S_BD
+async def delete_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    user_id = update.effective_user.id
+    if text == "⬅️ Orqaga":
+        return await royxat_menu(update, context)
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM shops WHERE user_id=$1 AND name=$2", user_id, text)
+    m = await update.message.reply_text(f"✅ '{text}' o'chirildi!")
+    asyncio.create_task(delete_msg_later(context, update.effective_chat.id, m.message_id))
+    return await royxat_menu(update, context)
 
-# ══════════════════════════════════════════════════════
-#  FALLBACK
-# ══════════════════════════════════════════════════════
-async def fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🏠 Asosiy menyu", reply_markup=MKB()); return S_MAIN
+async def show_shop_items(update, context, shop_id, shop_name):
+    async with db_pool.acquire() as conn:
+        items = await conn.fetch("SELECT * FROM items WHERE shop_id=$1 ORDER BY name", shop_id)
+    btns = [["➕ Tovar qo'shish", "🗑 Tovarni o'chirish"], ["⬅️ Orqaga"]]
+    txt = f"🏪 {shop_name}\n📦 Tovarlar: {len(items)} ta"
+    await update.message.reply_text(txt, reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True))
+    return SHOP_ITEMS_MENU
 
-# ══════════════════════════════════════════════════════
-#  RUN
-# ══════════════════════════════════════════════════════
+async def shop_items_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    shop_id = context.user_data.get('current_shop_id')
+    shop_name = context.user_data.get('current_shop_name')
+    user_id = update.effective_user.id
+    if text == "⬅️ Orqaga":
+        return await royxat_menu(update, context)
+    if text == "➕ Tovar qo'shish":
+        await update.message.reply_text("📦 Tovar nomini kiriting:", reply_markup=back_keyboard())
+        return ADD_ITEM
+    if text == "🗑 Tovarni o'chirish":
+        async with db_pool.acquire() as conn:
+            items = await conn.fetch("SELECT * FROM items WHERE shop_id=$1", shop_id)
+        if not items:
+            m = await update.message.reply_text("❌ Tovarlar yo'q!")
+            asyncio.create_task(delete_msg_later(context, update.effective_chat.id, m.message_id))
+            return SHOP_ITEMS_MENU
+        btns = [[i['name']] for i in items]
+        btns.append(["⬅️ Orqaga"])
+        await update.message.reply_text("🗑 Qaysi tovarni o'chirmoqchisiz?",
+            reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True))
+        return DELETE_ITEM
+    return SHOP_ITEMS_MENU
+
+async def add_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    shop_id = context.user_data.get('current_shop_id')
+    shop_name = context.user_data.get('current_shop_name')
+    if text == "⬅️ Orqaga":
+        return await show_shop_items(update, context, shop_id, shop_name)
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("INSERT INTO items(shop_id,name) VALUES($1,$2)", shop_id, text)
+        m = await update.message.reply_text(f"✅ '{text}' tovar qo'shildi!")
+        asyncio.create_task(delete_msg_later(context, update.effective_chat.id, m.message_id))
+    except:
+        m = await update.message.reply_text("❌ Bu tovar allaqachon mavjud!")
+        asyncio.create_task(delete_msg_later(context, update.effective_chat.id, m.message_id))
+    return await show_shop_items(update, context, shop_id, shop_name)
+
+async def delete_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    shop_id = context.user_data.get('current_shop_id')
+    shop_name = context.user_data.get('current_shop_name')
+    if text == "⬅️ Orqaga":
+        return await show_shop_items(update, context, shop_id, shop_name)
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM items WHERE shop_id=$1 AND name=$2", shop_id, text)
+    m = await update.message.reply_text(f"✅ '{text}' o'chirildi!")
+    asyncio.create_task(delete_msg_later(context, update.effective_chat.id, m.message_id))
+    return await show_shop_items(update, context, shop_id, shop_name)
+
+# =================== BOZORGA RO'YXAT ===================
+
+async def bozor_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = await get_user(user_id)
+    year = user['selected_year']
+    month = user['selected_month']
+    btns = []
+    row = []
+    for d in range(1, 32):
+        row.append(str(d))
+        if len(row) == 7:
+            btns.append(row)
+            row = []
+    if row:
+        btns.append(row)
+    btns.append(["⬅️ Orqaga"])
+    await update.message.reply_text(
+        f"📅 {MONTHS[month-1]} {year}\nBozorga sanani tanlang:",
+        reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True)
+    )
+    return BOZOR_SELECT_DATE
+
+async def bozor_date_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    user_id = update.effective_user.id
+    if text == "⬅️ Orqaga":
+        return await go_main(update, context)
+    try:
+        day = int(text)
+        context.user_data['bozor_day'] = day
+        user = await get_user(user_id)
+        context.user_data['bozor_year'] = user['selected_year']
+        context.user_data['bozor_month'] = user['selected_month']
+        return await show_bozor_shops(update, context)
+    except:
+        return BOZOR_SELECT_DATE
+
+async def show_bozor_shops(update, context):
+    user_id = update.effective_user.id
+    day = context.user_data.get('bozor_day')
+    year = context.user_data.get('bozor_year')
+    month = context.user_data.get('bozor_month')
+    async with db_pool.acquire() as conn:
+        shops = await conn.fetch("SELECT * FROM shops WHERE user_id=$1 ORDER BY name", user_id)
+        cart_items = await conn.fetch("""
+            SELECT c.*, i.name as iname, s.name as sname
+            FROM cart c
+            JOIN items i ON c.item_id=i.id
+            JOIN shops s ON c.shop_id=s.id
+            WHERE c.user_id=$1 AND c.year=$2 AND c.month=$3 AND c.day=$4
+        """, user_id, year, month, day)
+    cart_count = len(cart_items)
+    btns = [[s['name']] for s in shops]
+    btns.append(["🗑 Savatdan o'chirish", f"🛒 Savat ({cart_count})"])
+    btns.append(["⬅️ Orqaga"])
+    txt = f"🏪 Do'konni tanlang\n📅 {day}.{month:02d}.{year}\n🛒 Savatda: {cart_count} ta tovar"
+    await update.message.reply_text(txt, reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True))
+    return BOZOR_SHOP_MENU
+
+async def bozor_shop_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    user_id = update.effective_user.id
+    day = context.user_data.get('bozor_day')
+    year = context.user_data.get('bozor_year')
+    month = context.user_data.get('bozor_month')
+
+    if text == "⬅️ Orqaga":
+        return await bozor_menu(update, context)
+
+    if text == f"🛒 Savat ({await get_cart_count(user_id,year,month,day)})":
+        return await show_cart(update, context)
+
+    # Handle dynamic cart button
+    if text.startswith("🛒 Savat"):
+        return await show_cart(update, context)
+
+    if text == "🗑 Savatdan o'chirish":
+        async with db_pool.acquire() as conn:
+            items_in_cart = await conn.fetch("""
+                SELECT c.id, i.name as iname, s.name as sname, c.quantity, c.unit
+                FROM cart c
+                JOIN items i ON c.item_id=i.id
+                JOIN shops s ON c.shop_id=s.id
+                WHERE c.user_id=$1 AND c.year=$2 AND c.month=$3 AND c.day=$4
+                ORDER BY s.name, i.name
+            """, user_id, year, month, day)
+        if not items_in_cart:
+            m = await update.message.reply_text("❌ Savat bo'sh!")
+            asyncio.create_task(delete_msg_later(context, update.effective_chat.id, m.message_id))
+            return await show_bozor_shops(update, context)
+        context.user_data['delete_from_cart'] = True
+        btns = [[f"🗑 {i['iname']} ({i['quantity']}{i['unit']}) - {i['sname']}"] for i in items_in_cart]
+        btns.append(["⬅️ Orqaga"])
+        await update.message.reply_text("O'chirmoqchi bo'lgan tovarni tanlang:",
+            reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True))
+        return BOZOR_ITEM_SELECT
+
+    # Shop selected
+    async with db_pool.acquire() as conn:
+        shop = await conn.fetchrow("SELECT * FROM shops WHERE user_id=$1 AND name=$2", user_id, text)
+    if not shop:
+        return BOZOR_SHOP_MENU
+
+    context.user_data['bozor_shop_id'] = shop['id']
+    context.user_data['bozor_shop_name'] = shop['name']
+
+    async with db_pool.acquire() as conn:
+        items = await conn.fetch("SELECT * FROM items WHERE shop_id=$1 ORDER BY name", shop['id'])
+        cart_items = await conn.fetch("""
+            SELECT i.name FROM cart c JOIN items i ON c.item_id=i.id
+            WHERE c.user_id=$1 AND c.shop_id=$2 AND c.year=$3 AND c.month=$4 AND c.day=$5
+        """, user_id, shop['id'], year, month, day)
+
+    cart_names = [ci['name'] for ci in cart_items]
+    btns = []
+    for item in items:
+        prefix = "✅ " if item['name'] in cart_names else ""
+        btns.append([f"{prefix}{item['name']}"])
+    btns.append(["➕ Tovar qo'shish (bu do'kon)"])
+    btns.append(["⬅️ Orqaga"])
+    await update.message.reply_text(
+        f"🏪 {shop['name']}\nNima xarid qilmoqchisiz?",
+        reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True)
+    )
+    return BOZOR_ITEM_SELECT
+
+async def get_cart_count(user_id, year, month, day):
+    async with db_pool.acquire() as conn:
+        r = await conn.fetchval("""
+            SELECT COUNT(*) FROM cart WHERE user_id=$1 AND year=$2 AND month=$3 AND day=$4
+        """, user_id, year, month, day)
+    return r or 0
+
+async def bozor_item_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    user_id = update.effective_user.id
+    day = context.user_data.get('bozor_day')
+    year = context.user_data.get('bozor_year')
+    month = context.user_data.get('bozor_month')
+    shop_id = context.user_data.get('bozor_shop_id')
+    shop_name = context.user_data.get('bozor_shop_name')
+
+    if text == "⬅️ Orqaga":
+        return await show_bozor_shops(update, context)
+
+    # Delete from cart mode
+    if context.user_data.get('delete_from_cart') and text.startswith("🗑 "):
+        item_name = text.split("🗑 ")[1].split(" (")[0]
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                DELETE FROM cart WHERE user_id=$1 AND year=$2 AND month=$3 AND day=$4
+                AND item_id=(SELECT i.id FROM items i JOIN shops s ON i.shop_id=s.id
+                WHERE i.name=$5 AND s.user_id=$1 LIMIT 1)
+            """, user_id, year, month, day, item_name)
+        context.user_data.pop('delete_from_cart', None)
+        m = await update.message.reply_text(f"✅ '{item_name}' savatdan o'chirildi!")
+        asyncio.create_task(delete_msg_later(context, update.effective_chat.id, m.message_id))
+        return await show_bozor_shops(update, context)
+
+    if text == "➕ Tovar qo'shish (bu do'kon)":
+        await update.message.reply_text(
+            f"🏪 {shop_name}\nBu do'kondan nima olmoqchisiz? Tovar nomini kiriting:",
+            reply_markup=back_keyboard()
+        )
+        context.user_data['adding_custom_bozor_item'] = True
+        return BOZOR_ITEM_SELECT
+
+    if context.user_data.get('adding_custom_bozor_item'):
+        if text == "⬅️ Orqaga":
+            context.user_data.pop('adding_custom_bozor_item', None)
+            return await show_bozor_shops(update, context)
+        # Add new item to shop and cart
+        async with db_pool.acquire() as conn:
+            try:
+                await conn.execute("INSERT INTO items(shop_id,name) VALUES($1,$2)", shop_id, text)
+            except:
+                pass
+            item = await conn.fetchrow("SELECT * FROM items WHERE shop_id=$1 AND name=$2", shop_id, text)
+        context.user_data['bozor_item_id'] = item['id']
+        context.user_data['bozor_item_name'] = text
+        context.user_data.pop('adding_custom_bozor_item', None)
+        return await ask_unit(update, context)
+
+    # Item selected (remove ✅ prefix if any)
+    item_name = text.replace("✅ ", "")
+    async with db_pool.acquire() as conn:
+        item = await conn.fetchrow("SELECT * FROM items WHERE shop_id=$1 AND name=$2", shop_id, item_name)
+    if not item:
+        return BOZOR_ITEM_SELECT
+
+    context.user_data['bozor_item_id'] = item['id']
+    context.user_data['bozor_item_name'] = item_name
+    return await ask_unit(update, context)
+
+async def ask_unit(update, context):
+    item_name = context.user_data.get('bozor_item_name')
+    # Check if already in cart
+    user_id = update.effective_user.id
+    day = context.user_data.get('bozor_day')
+    year = context.user_data.get('bozor_year')
+    month = context.user_data.get('bozor_month')
+    item_id = context.user_data.get('bozor_item_id')
+
+    async with db_pool.acquire() as conn:
+        existing = await conn.fetchrow("""
+            SELECT * FROM cart WHERE user_id=$1 AND item_id=$2 AND year=$3 AND month=$4 AND day=$5
+        """, user_id, item_id, year, month, day)
+
+    if existing:
+        unit_btn = f"✅ {existing['unit']} ({existing['quantity']})"
+        btns = [[unit_btn], ["kg", "dona"], ["⬅️ Orqaga"]]
+    else:
+        btns = [["kg", "dona"], ["⬅️ Orqaga"]]
+
+    await update.message.reply_text(
+        f"📦 {item_name}\nBirligini tanlang:",
+        reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True)
+    )
+    return BOZOR_UNIT_SELECT
+
+async def bozor_unit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Orqaga":
+        return await show_bozor_shops(update, context)
+    if text == "kg" or "kg" in text:
+        context.user_data['bozor_unit'] = 'kg'
+        btns = [["-10", "-0.5", "0.5kg", "+0.5", "+10"], ["⬅️ Orqaga"]]
+        await update.message.reply_text(
+            f"⚖️ Necha kg?",
+            reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True)
+        )
+        context.user_data['bozor_qty'] = 0.5
+        return BOZOR_KG_SELECT
+    if text == "dona" or "dona" in text:
+        context.user_data['bozor_unit'] = 'dona'
+        btns = [["-1", "1dona", "+1"], ["⬅️ Orqaga"]]
+        await update.message.reply_text(
+            f"🔢 Nechta dona?",
+            reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True)
+        )
+        context.user_data['bozor_qty'] = 1
+        return BOZOR_DONA_SELECT
+    return BOZOR_UNIT_SELECT
+
+async def bozor_kg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Orqaga":
+        return await ask_unit(update, context)
+    qty = context.user_data.get('bozor_qty', 0.5)
+    if text == "+0.5":
+        qty += 0.5
+    elif text == "-0.5":
+        qty = max(0.5, qty - 0.5)
+    elif text == "+10":
+        qty += 10
+    elif text == "-10":
+        qty = max(0.5, qty - 10)
+    elif text == "0.5kg":
+        pass
+    else:
+        try:
+            qty = float(text)
+        except:
+            pass
+    context.user_data['bozor_qty'] = qty
+    btns = [["-10", "-0.5", f"{qty}kg", "+0.5", "+10"], ["✅ Saqlash"], ["⬅️ Orqaga"]]
+    await update.message.reply_text(
+        f"⚖️ {qty} kg tanlandi",
+        reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True)
+    )
+    return BOZOR_KG_SELECT
+
+async def bozor_dona_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Orqaga":
+        return await ask_unit(update, context)
+    qty = context.user_data.get('bozor_qty', 1)
+    if text == "+1":
+        qty += 1
+    elif text == "-1":
+        qty = max(1, qty - 1)
+    elif text == "1dona":
+        pass
+    else:
+        try:
+            qty = int(text)
+        except:
+            pass
+    context.user_data['bozor_qty'] = qty
+    btns = [["-1", f"{qty}dona", "+1"], ["✅ Saqlash"], ["⬅️ Orqaga"]]
+    await update.message.reply_text(
+        f"🔢 {qty} dona tanlandi",
+        reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True)
+    )
+    return BOZOR_DONA_SELECT
+
+async def save_to_cart(update, context):
+    user_id = update.effective_user.id
+    day = context.user_data.get('bozor_day')
+    year = context.user_data.get('bozor_year')
+    month = context.user_data.get('bozor_month')
+    shop_id = context.user_data.get('bozor_shop_id')
+    item_id = context.user_data.get('bozor_item_id')
+    item_name = context.user_data.get('bozor_item_name')
+    unit = context.user_data.get('bozor_unit', 'dona')
+    qty = context.user_data.get('bozor_qty', 1)
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO cart(user_id,shop_id,item_id,year,month,day,unit,quantity)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+            ON CONFLICT(user_id,item_id,year,month,day)
+            DO UPDATE SET unit=$7, quantity=$8
+        """, user_id, shop_id, item_id, year, month, day, unit, qty)
+
+    m = await update.message.reply_text(f"✅ '{item_name}' {qty}{unit} savatga qo'shildi!")
+    asyncio.create_task(delete_msg_later(context, update.effective_chat.id, m.message_id))
+    return await show_bozor_shops(update, context)
+
+async def bozor_kg_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "✅ Saqlash":
+        return await save_to_cart(update, context)
+    return await bozor_kg_handler(update, context)
+
+async def bozor_dona_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "✅ Saqlash":
+        return await save_to_cart(update, context)
+    return await bozor_dona_handler(update, context)
+
+async def show_cart(update, context):
+    user_id = update.effective_user.id
+    day = context.user_data.get('bozor_day')
+    year = context.user_data.get('bozor_year')
+    month = context.user_data.get('bozor_month')
+    async with db_pool.acquire() as conn:
+        items = await conn.fetch("""
+            SELECT c.*, i.name as iname, s.name as sname
+            FROM cart c JOIN items i ON c.item_id=i.id JOIN shops s ON c.shop_id=s.id
+            WHERE c.user_id=$1 AND c.year=$2 AND c.month=$3 AND c.day=$4
+            ORDER BY s.name, i.name
+        """, user_id, year, month, day)
+    if not items:
+        m = await update.message.reply_text("🛒 Savat bo'sh!")
+        asyncio.create_task(delete_msg_later(context, update.effective_chat.id, m.message_id))
+        return await show_bozor_shops(update, context)
+
+    txt = f"🛒 Savat - {day}.{month:02d}.{year}\n\n"
+    cur_shop = ""
+    for i in items:
+        if i['sname'] != cur_shop:
+            cur_shop = i['sname']
+            txt += f"\n🏪 {cur_shop}:\n"
+        txt += f"  📦 {i['iname']} - {i['quantity']}{i['unit']}\n"
+    await update.message.reply_text(txt, reply_markup=ReplyKeyboardMarkup([["⬅️ Orqaga"]], resize_keyboard=True))
+    return BOZOR_SHOP_MENU
+
+# =================== NARXLARNI KIRITISH ===================
+
+async def narx_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = await get_user(user_id)
+    year = user['selected_year']
+    month = user['selected_month']
+    async with db_pool.acquire() as conn:
+        days_with_cart = await conn.fetch("""
+            SELECT DISTINCT day FROM cart
+            WHERE user_id=$1 AND year=$2 AND month=$3 ORDER BY day
+        """, user_id, year, month)
+    if not days_with_cart:
+        m = await update.message.reply_text("❌ Hech qanday sana uchun savat to'ldirilmagan!")
+        asyncio.create_task(delete_msg_later(context, update.effective_chat.id, m.message_id))
+        return await go_main(update, context)
+    btns = [[str(d['day'])] for d in days_with_cart]
+    btns.append(["⬅️ Orqaga"])
+    await update.message.reply_text(
+        f"📅 {MONTHS[month-1]} {year}\nNarx kiritish uchun sanani tanlang:",
+        reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True)
+    )
+    return NARX_SELECT_DATE
+
+async def narx_date_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    user_id = update.effective_user.id
+    if text == "⬅️ Orqaga":
+        return await go_main(update, context)
+    try:
+        day = int(text)
+        context.user_data['narx_day'] = day
+        user = await get_user(user_id)
+        context.user_data['narx_year'] = user['selected_year']
+        context.user_data['narx_month'] = user['selected_month']
+        return await show_narx_shops(update, context)
+    except:
+        return NARX_SELECT_DATE
+
+async def show_narx_shops(update, context):
+    user_id = update.effective_user.id
+    day = context.user_data.get('narx_day')
+    year = context.user_data.get('narx_year')
+    month = context.user_data.get('narx_month')
+    async with db_pool.acquire() as conn:
+        shops = await conn.fetch("""
+            SELECT DISTINCT s.id, s.name FROM cart c
+            JOIN shops s ON c.shop_id=s.id
+            WHERE c.user_id=$1 AND c.year=$2 AND c.month=$3 AND c.day=$4
+            ORDER BY s.name
+        """, user_id, year, month, day)
+    btns = [[s['name']] for s in shops]
+    btns.append(["⬅️ Orqaga"])
+    await update.message.reply_text(
+        f"📅 {day}.{month:02d}.{year}\nDo'konni tanlang:",
+        reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True)
+    )
+    return NARX_SHOP_MENU
+
+async def narx_shop_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    user_id = update.effective_user.id
+    if text == "⬅️ Orqaga":
+        return await narx_menu(update, context)
+    async with db_pool.acquire() as conn:
+        shop = await conn.fetchrow("SELECT * FROM shops WHERE user_id=$1 AND name=$2", user_id, text)
+    if not shop:
+        return NARX_SHOP_MENU
+    context.user_data['narx_shop_id'] = shop['id']
+    context.user_data['narx_shop_name'] = shop['name']
+    return await show_narx_items(update, context)
+
+async def show_narx_items(update, context):
+    user_id = update.effective_user.id
+    day = context.user_data.get('narx_day')
+    year = context.user_data.get('narx_year')
+    month = context.user_data.get('narx_month')
+    shop_id = context.user_data.get('narx_shop_id')
+    shop_name = context.user_data.get('narx_shop_name')
+
+    async with db_pool.acquire() as conn:
+        cart_items = await conn.fetch("""
+            SELECT c.*, i.name as iname FROM cart c JOIN items i ON c.item_id=i.id
+            WHERE c.user_id=$1 AND c.shop_id=$2 AND c.year=$3 AND c.month=$4 AND c.day=$5
+            ORDER BY i.name
+        """, user_id, shop_id, year, month, day)
+        price_records = await conn.fetch("""
+            SELECT item_id FROM prices
+            WHERE user_id=$1 AND shop_id=$2 AND year=$3 AND month=$4 AND day=$5
+        """, user_id, shop_id, year, month, day)
+
+    priced_ids = {p['item_id'] for p in price_records}
+    btns = []
+    for ci in cart_items:
+        prefix = "✅ " if ci['item_id'] in priced_ids else ""
+        btns.append([f"{prefix}{ci['iname']} ({ci['quantity']}{ci['unit']})"])
+    btns.append(["⬅️ Orqaga"])
+    await update.message.reply_text(
+        f"🏪 {shop_name} - {day}.{month:02d}.{year}\nTovarni tanlang:",
+        reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True)
+    )
+    return NARX_ITEM_MENU
+
+async def narx_item_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    user_id = update.effective_user.id
+    shop_id = context.user_data.get('narx_shop_id')
+    day = context.user_data.get('narx_day')
+    year = context.user_data.get('narx_year')
+    month = context.user_data.get('narx_month')
+
+    if text == "⬅️ Orqaga":
+        return await show_narx_shops(update, context)
+
+    # Parse item name (remove prefix and qty suffix)
+    clean = text.replace("✅ ", "")
+    item_name = clean.split(" (")[0]
+
+    async with db_pool.acquire() as conn:
+        item = await conn.fetchrow("""
+            SELECT i.* FROM items i WHERE i.shop_id=$1 AND i.name=$2
+        """, shop_id, item_name)
+        if not item:
+            return NARX_ITEM_MENU
+        cart_item = await conn.fetchrow("""
+            SELECT * FROM cart WHERE user_id=$1 AND item_id=$2 AND year=$3 AND month=$4 AND day=$5
+        """, user_id, item['id'], year, month, day)
+        last_price = await conn.fetchrow("""
+            SELECT price_per_unit, unit FROM prices
+            WHERE user_id=$1 AND item_id=$2
+            ORDER BY year DESC, month DESC, day DESC LIMIT 1
+        """, user_id, item['id'])
+
+    context.user_data['narx_item_id'] = item['id']
+    context.user_data['narx_item_name'] = item_name
+    if cart_item:
+        context.user_data['narx_unit'] = cart_item['unit']
+        context.user_data['narx_qty'] = cart_item['quantity']
+
+    qty = cart_item['quantity'] if cart_item else 1
+    unit = cart_item['unit'] if cart_item else 'dona'
+    last_price_txt = f"\n⬇️ Oxirgi narx: {last_price['price_per_unit']:,.0f} so'm/{last_price['unit']}" if last_price else ""
+
+    btns = [
+        [f"💰 Narxini kiritish ({qty}{unit})"],
+        ["⚖️ kg/dona o'zgartirish"],
+        ["⬅️ Orqaga"]
+    ]
+    await update.message.reply_text(
+        f"📦 {item_name}\n📊 {qty}{unit} oldingiz{last_price_txt}\n\nNimani qilmoqchisiz?",
+        reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True)
+    )
+    return NARX_ITEM_MENU
+
+async def narx_item_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    item_name = context.user_data.get('narx_item_name')
+    qty = context.user_data.get('narx_qty', 1)
+    unit = context.user_data.get('narx_unit', 'dona')
+
+    if text == "⬅️ Orqaga":
+        return await show_narx_items(update, context)
+
+    if text.startswith("💰 Narxini kiritish"):
+        last_price = await get_last_price(
+            update.effective_user.id,
+            context.user_data.get('narx_item_id')
+        )
+        last_txt = f"\n⬇️ Oxirgi narx: {last_price:,.0f} so'm" if last_price else ""
+        await update.message.reply_text(
+            f"📦 {item_name} - {qty}{unit} oldingiz\n💰 1{unit} narxini kiriting (faqat raqam){last_txt}:",
+            reply_markup=back_keyboard()
+        )
+        context.user_data['entering_price'] = True
+        return ENTER_PRICE
+
+    if text == "⚖️ kg/dona o'zgartirish":
+        btns = [["kg", "dona"], ["⬅️ Orqaga"]]
+        await update.message.reply_text("Birlikni tanlang:", reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True))
+        return NARX_UNIT_CHANGE
+
+    return NARX_ITEM_MENU
+
+async def get_last_price(user_id, item_id):
+    async with db_pool.acquire() as conn:
+        r = await conn.fetchrow("""
+            SELECT price_per_unit FROM prices WHERE user_id=$1 AND item_id=$2
+            ORDER BY year DESC, month DESC, day DESC LIMIT 1
+        """, user_id, item_id)
+    return r['price_per_unit'] if r else None
+
+async def narx_unit_change(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    user_id = update.effective_user.id
+    item_id = context.user_data.get('narx_item_id')
+    item_name = context.user_data.get('narx_item_name')
+
+    if text == "⬅️ Orqaga":
+        return await narx_item_handler(update, context)
+
+    if text in ["kg", "dona"]:
+        context.user_data['narx_unit'] = text
+        context.user_data['changing_unit'] = True
+        if text == "kg":
+            btns = [["-10", "-0.5", "0.5kg", "+0.5", "+10"], ["✅ Saqlash"], ["⬅️ Orqaga"]]
+            context.user_data['narx_qty'] = 0.5
+        else:
+            btns = [["-1", "1dona", "+1"], ["✅ Saqlash"], ["⬅️ Orqaga"]]
+            context.user_data['narx_qty'] = 1
+        await update.message.reply_text(
+            f"📦 {item_name} - necha {text}?",
+            reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True)
+        )
+        if text == "kg":
+            return NARX_KG_CHANGE
+        return NARX_DONA_CHANGE
+    return NARX_UNIT_CHANGE
+
+async def narx_kg_change(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Orqaga":
+        return await show_narx_items(update, context)
+    qty = context.user_data.get('narx_qty', 0.5)
+    if text == "+0.5": qty += 0.5
+    elif text == "-0.5": qty = max(0.5, qty - 0.5)
+    elif text == "+10": qty += 10
+    elif text == "-10": qty = max(0.5, qty - 10)
+    if text == "✅ Saqlash":
+        await update_cart_unit(update.effective_user.id, context, 'kg', qty)
+        return await show_narx_items(update, context)
+    context.user_data['narx_qty'] = qty
+    btns = [["-10", "-0.5", f"{qty}kg", "+0.5", "+10"], ["✅ Saqlash"], ["⬅️ Orqaga"]]
+    await update.message.reply_text(f"⚖️ {qty} kg", reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True))
+    return NARX_KG_CHANGE
+
+async def narx_dona_change(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Orqaga":
+        return await show_narx_items(update, context)
+    qty = context.user_data.get('narx_qty', 1)
+    if text == "+1": qty += 1
+    elif text == "-1": qty = max(1, qty - 1)
+    if text == "✅ Saqlash":
+        await update_cart_unit(update.effective_user.id, context, 'dona', qty)
+        return await show_narx_items(update, context)
+    context.user_data['narx_qty'] = qty
+    btns = [["-1", f"{qty}dona", "+1"], ["✅ Saqlash"], ["⬅️ Orqaga"]]
+    await update.message.reply_text(f"🔢 {qty} dona", reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True))
+    return NARX_DONA_CHANGE
+
+async def update_cart_unit(user_id, context, unit, qty):
+    item_id = context.user_data.get('narx_item_id')
+    day = context.user_data.get('narx_day')
+    year = context.user_data.get('narx_year')
+    month = context.user_data.get('narx_month')
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            UPDATE cart SET unit=$1, quantity=$2
+            WHERE user_id=$3 AND item_id=$4 AND year=$5 AND month=$6 AND day=$7
+        """, unit, qty, user_id, item_id, year, month, day)
+    context.user_data['narx_unit'] = unit
+    context.user_data['narx_qty'] = qty
+
+async def enter_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    user_id = update.effective_user.id
+    if text == "⬅️ Orqaga":
+        context.user_data.pop('entering_price', None)
+        return await show_narx_items(update, context)
+    try:
+        price = float(text.replace(",","").replace(" ",""))
+        item_id = context.user_data.get('narx_item_id')
+        item_name = context.user_data.get('narx_item_name')
+        shop_id = context.user_data.get('narx_shop_id')
+        day = context.user_data.get('narx_day')
+        year = context.user_data.get('narx_year')
+        month = context.user_data.get('narx_month')
+        unit = context.user_data.get('narx_unit', 'dona')
+        qty = context.user_data.get('narx_qty', 1)
+        total = price * qty
+
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO prices(user_id,shop_id,item_id,year,month,day,unit,quantity,price_per_unit,total_price)
+                VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                ON CONFLICT DO NOTHING
+            """, user_id, shop_id, item_id, year, month, day, unit, qty, price, total)
+
+        m = await update.message.reply_text(
+            f"✅ {item_name}: {qty}{unit} × {price:,.0f} = {total:,.0f} so'm saqlandi!"
+        )
+        asyncio.create_task(delete_msg_later(context, update.effective_chat.id, m.message_id))
+        context.user_data.pop('entering_price', None)
+        return await show_narx_items(update, context)
+    except:
+        m = await update.message.reply_text("❌ Faqat raqam kiriting!")
+        asyncio.create_task(delete_msg_later(context, update.effective_chat.id, m.message_id))
+        return ENTER_PRICE
+
+# =================== KUNLIK HISOBOT ===================
+
+async def hisobot_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = await get_user(user_id)
+    year = user['selected_year']
+    month = user['selected_month']
+    async with db_pool.acquire() as conn:
+        dates = await conn.fetch("""
+            SELECT DISTINCT day FROM prices
+            WHERE user_id=$1 AND year=$2 AND month=$3 ORDER BY day
+        """, user_id, year, month)
+    if not dates:
+        m = await update.message.reply_text("❌ Hali narx kiritilmagan!")
+        asyncio.create_task(delete_msg_later(context, update.effective_chat.id, m.message_id))
+        return await go_main(update, context)
+    btns = [[f"{d['day']:02d}.{month:02d}.{year}"] for d in dates]
+    btns.append(["⬅️ Orqaga"])
+    await update.message.reply_text("📅 Sanani tanlang:", reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True))
+    return HISOBOT_DATE
+
+async def hisobot_date_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    user_id = update.effective_user.id
+    if text == "⬅️ Orqaga":
+        return await go_main(update, context)
+    try:
+        parts = text.split(".")
+        day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
+    except:
+        return HISOBOT_DATE
+
+    async with db_pool.acquire() as conn:
+        records = await conn.fetch("""
+            SELECT p.*, i.name as iname, s.name as sname
+            FROM prices p JOIN items i ON p.item_id=i.id JOIN shops s ON p.shop_id=s.id
+            WHERE p.user_id=$1 AND p.year=$2 AND p.month=$3 AND p.day=$4
+            ORDER BY s.name, i.name
+        """, user_id, year, month, day)
+
+    if not records:
+        m = await update.message.reply_text("❌ Bu sana uchun ma'lumot yo'q!")
+        asyncio.create_task(delete_msg_later(context, update.effective_chat.id, m.message_id))
+        return HISOBOT_DATE
+
+    txt = f"📊 {day:02d}.{month:02d}.{year} Hisobot\n\n"
+    cur_shop = ""
+    shop_total = 0
+    grand_total = 0
+    for r in records:
+        if r['sname'] != cur_shop:
+            if cur_shop:
+                txt += f"📦 {cur_shop} jami: {shop_total:,.0f} so'm\n\n"
+            cur_shop = r['sname']
+            shop_total = 0
+            txt += f"🏪 {cur_shop}:\n"
+        txt += f"  • {r['iname']} {r['quantity']}{r['unit']} - {r['total_price']:,.0f} so'm\n"
+        shop_total += r['total_price']
+        grand_total += r['total_price']
+    txt += f"📦 {cur_shop} jami: {shop_total:,.0f} so'm\n\n"
+    txt += f"💰 JAMI: {grand_total:,.0f} so'm"
+
+    await update.message.reply_text(txt, reply_markup=ReplyKeyboardMarkup([["⬅️ Orqaga"]], resize_keyboard=True))
+    return HISOBOT_DATE
+
+# =================== STATISTIKA ===================
+
+async def statistika(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = await get_user(user_id)
+    year = user['selected_year']
+    month = user['selected_month']
+
+    async with db_pool.acquire() as conn:
+        dates = await conn.fetch("""
+            SELECT DISTINCT day FROM prices
+            WHERE user_id=$1 AND year=$2 AND month=$3 ORDER BY day DESC LIMIT 3
+        """, user_id, year, month)
+
+    if len(dates) < 1:
+        m = await update.message.reply_text("❌ Yetarli ma'lumot yo'q!")
+        asyncio.create_task(delete_msg_later(context, update.effective_chat.id, m.message_id))
+        return await go_main(update, context)
+
+    days_sorted = sorted([d['day'] for d in dates])
+    latest_day = days_sorted[-1]
+    prev_days = days_sorted[:-1]
+
+    async with db_pool.acquire() as conn:
+        latest = await conn.fetch("""
+            SELECT p.*, i.name as iname, s.name as sname
+            FROM prices p JOIN items i ON p.item_id=i.id JOIN shops s ON p.shop_id=s.id
+            WHERE p.user_id=$1 AND p.year=$2 AND p.month=$3 AND p.day=$4
+            ORDER BY s.name, i.name
+        """, user_id, year, month, latest_day)
+
+    txt = f"📈 Statistika - {latest_day:02d}.{month:02d}.{year}\n\n"
+    rose = []
+    fell = []
+    cur_shop = ""
+
+    for r in latest:
+        if r['sname'] != cur_shop:
+            cur_shop = r['sname']
+            txt += f"\n🏪 {cur_shop}:\n"
+
+        cur_price = r['price_per_unit']
+        prev_info = []
+        trend = "✅"
+
+        for pd in prev_days:
+            async with db_pool.acquire() as conn:
+                prev = await conn.fetchrow("""
+                    SELECT price_per_unit, day FROM prices
+                    WHERE user_id=$1 AND item_id=$2 AND year=$3 AND month=$4 AND day=$5
+                """, user_id, r['item_id'], year, month, pd)
+            if prev:
+                prev_info.append(f"{pd:02d}.{month:02d}.{year}-{prev['price_per_unit']:,.0f} so'm")
+                if cur_price > prev['price_per_unit']:
+                    trend = "❌↗️"
+                elif cur_price < prev['price_per_unit'] and trend != "❌↗️":
+                    trend = "⭕️↘️"
+
+        if trend == "❌↗️":
+            rose.append(f"{r['iname']}")
+        elif trend == "⭕️↘️":
+            fell.append(f"{r['iname']}")
+
+        prev_txt = " / ".join(prev_info) if prev_info else "Ma'lumot yo'q"
+        txt += f"  {r['iname']} {trend}\n"
+        txt += f"    💰 {cur_price:,.0f} so'm / ({prev_txt})\n"
+
+    txt += f"\n📊 Xulosa:\n"
+    if rose:
+        txt += f"❌↗️ Oshgan: {', '.join(rose)}\n"
+    if fell:
+        txt += f"⭕️↘️ Tushgan: {', '.join(fell)}\n"
+
+    await update.message.reply_text(txt, reply_markup=main_menu_keyboard())
+    return MAIN_MENU
+
+# =================== OXIRGI AMALNI O'CHIRISH ===================
+
+async def oxirgi_amal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = await get_user(user_id)
+    year = user['selected_year']
+    month = user['selected_month']
+
+    async with db_pool.acquire() as conn:
+        dates = await conn.fetch("""
+            SELECT DISTINCT day FROM prices
+            WHERE user_id=$1 AND year=$2 AND month=$3 ORDER BY day
+        """, user_id, year, month)
+
+    if not dates:
+        m = await update.message.reply_text("❌ O'chirish uchun ma'lumot yo'q!")
+        asyncio.create_task(delete_msg_later(context, update.effective_chat.id, m.message_id))
+        return await go_main(update, context)
+
+    btns = [[f"{d['day']:02d}.{month:02d}.{year}"] for d in dates]
+    btns.append(["⬅️ Orqaga"])
+    await update.message.reply_text(
+        "🗑 Qaysi sanadagi oxirgi amalni o'chirmoqchisiz?",
+        reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True)
+    )
+    return OXIRGI_AMAL_DATE
+
+async def oxirgi_amal_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    user_id = update.effective_user.id
+    if text == "⬅️ Orqaga":
+        return await go_main(update, context)
+    try:
+        parts = text.split(".")
+        day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
+    except:
+        return OXIRGI_AMAL_DATE
+
+    async with db_pool.acquire() as conn:
+        last = await conn.fetchrow("""
+            SELECT p.id, i.name as iname FROM prices p JOIN items i ON p.item_id=i.id
+            WHERE p.user_id=$1 AND p.year=$2 AND p.month=$3 AND p.day=$4
+            ORDER BY p.created_at DESC LIMIT 1
+        """, user_id, year, month, day)
+
+        if not last:
+            m = await update.message.reply_text("❌ Bu sana uchun ma'lumot yo'q!")
+            asyncio.create_task(delete_msg_later(context, update.effective_chat.id, m.message_id))
+            return OXIRGI_AMAL_DATE
+
+        await conn.execute("DELETE FROM prices WHERE id=$1", last['id'])
+
+    m = await update.message.reply_text(f"✅ '{last['iname']}' narxi o'chirildi!")
+    asyncio.create_task(delete_msg_later(context, update.effective_chat.id, m.message_id))
+    return OXIRGI_AMAL_DATE
+
+# =================== SAVAT JAMI NARXI ===================
+
+async def savat_jami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = await get_user(user_id)
+    year = user['selected_year']
+    month = user['selected_month']
+
+    async with db_pool.acquire() as conn:
+        days = await conn.fetch("""
+            SELECT DISTINCT day FROM cart
+            WHERE user_id=$1 AND year=$2 AND month=$3 ORDER BY day
+        """, user_id, year, month)
+
+    if not days:
+        m = await update.message.reply_text("❌ Savat bo'sh!")
+        asyncio.create_task(delete_msg_later(context, update.effective_chat.id, m.message_id))
+        return MAIN_MENU
+
+    txt = f"💼 Savat Jami Narxi - {MONTHS[month-1]} {year}\n\n"
+    for d in days:
+        day = d['day']
+        async with db_pool.acquire() as conn:
+            items = await conn.fetch("""
+                SELECT c.*, i.name as iname, s.name as sname,
+                (SELECT price_per_unit FROM prices p2
+                 WHERE p2.user_id=c.user_id AND p2.item_id=c.item_id
+                 ORDER BY p2.year DESC, p2.month DESC, p2.day DESC LIMIT 1) as last_price
+                FROM cart c JOIN items i ON c.item_id=i.id JOIN shops s ON c.shop_id=s.id
+                WHERE c.user_id=$1 AND c.year=$2 AND c.month=$3 AND c.day=$4
+                ORDER BY s.name, i.name
+            """, user_id, year, month, day)
+
+        day_total = sum((i['last_price'] or 0) * i['quantity'] for i in items)
+        txt += f"📅 {day:02d}.{month:02d}.{year}: {day_total:,.0f} so'm\n"
+
+    await update.message.reply_text(txt, reply_markup=main_menu_keyboard())
+    return MAIN_MENU
+
+# =================== HEALTH SERVER ===================
+
+async def health_server():
+    from aiohttp import web
+    app = web.Application()
+    async def health(request):
+        return web.Response(text="OK")
+    app.router.add_get("/", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000)))
+    await site.start()
+    logger.info("✅ Health server :10000")
+
+# =================== MAIN ===================
+
 def main():
-    threading.Thread(target=health, daemon=True).start()
-    logger.info(f"✅ Health server :{PORT}")
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(init_db())
+    loop.run_until_complete(health_server())
 
     app = Application.builder().token(TOKEN).build()
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            S_MAIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, main_h)],
-            S_CY:   [MessageHandler(filters.TEXT & ~filters.COMMAND, cy_h)],
-            S_CM:   [MessageHandler(filters.TEXT & ~filters.COMMAND, cm_h)],
-            S_LST:  [MessageHandler(filters.TEXT & ~filters.COMMAND, lst_h)],
-            S_AS:   [MessageHandler(filters.TEXT & ~filters.COMMAND, as_h)],
-            S_DS:   [MessageHandler(filters.TEXT & ~filters.COMMAND, ds_h)],
-            S_SH:   [MessageHandler(filters.TEXT & ~filters.COMMAND, sh_h)],
-            S_AI:   [MessageHandler(filters.TEXT & ~filters.COMMAND, ai_h)],
-            S_DI:   [MessageHandler(filters.TEXT & ~filters.COMMAND, di_h)],
-            S_MD:   [MessageHandler(filters.TEXT & ~filters.COMMAND, md_h)],
-            S_MSH:  [MessageHandler(filters.TEXT & ~filters.COMMAND, msh_h)],
-            S_MI:   [MessageHandler(filters.TEXT & ~filters.COMMAND, mi_h)],
-            S_MU:   [MessageHandler(filters.TEXT & ~filters.COMMAND, mu_h)],
-            S_MQ:   [MessageHandler(filters.TEXT & ~filters.COMMAND, mq_h)],
-            S_MAI:  [MessageHandler(filters.TEXT & ~filters.COMMAND, mai_h)],
-            S_MDL:  [MessageHandler(filters.TEXT & ~filters.COMMAND, mdl_h)],
-            S_PD:   [MessageHandler(filters.TEXT & ~filters.COMMAND, pd_h)],
-            S_PSH:  [MessageHandler(filters.TEXT & ~filters.COMMAND, psh_h)],
-            S_PI:   [MessageHandler(filters.TEXT & ~filters.COMMAND, pi_h)],
-            S_PCU:  [MessageHandler(filters.TEXT & ~filters.COMMAND, pcu_h)],
-            S_PKG:  [MessageHandler(filters.TEXT & ~filters.COMMAND, pkg_h)],
-            S_PDN:  [MessageHandler(filters.TEXT & ~filters.COMMAND, pdn_h)],
-            S_PE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, pe_h)],
-            S_RD:   [MessageHandler(filters.TEXT & ~filters.COMMAND, rd_h)],
-            S_ST:   [MessageHandler(filters.TEXT & ~filters.COMMAND, st_h)],
-            S_UD:   [MessageHandler(filters.TEXT & ~filters.COMMAND, ud_h)],
-            S_BD:   [MessageHandler(filters.TEXT & ~filters.COMMAND, bd_h)],
+            MAIN_MENU: [
+                MessageHandler(filters.Regex("^🛒 Ro'yxat kiritish$"), royxat_menu),
+                MessageHandler(filters.Regex("^🏪 Bozorga ro'yxat$"), bozor_menu),
+                MessageHandler(filters.Regex("^💰 Narxlarni kiritish$"), narx_menu),
+                MessageHandler(filters.Regex("^📊 Kunlik hisobot$"), hisobot_menu),
+                MessageHandler(filters.Regex("^📈 Statistika$"), statistika),
+                MessageHandler(filters.Regex("^🗑 Oxirgi amalni o'chirish$"), oxirgi_amal),
+                MessageHandler(filters.Regex("^💼 Savat jami narxi$"), savat_jami),
+                MessageHandler(filters.Regex("^📅 Yilni o'zgartirish$"), change_year),
+                MessageHandler(filters.Regex("^🗓 Oyni o'zgartirish$"), change_month),
+            ],
+            CHANGE_YEAR: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_change_year)],
+            CHANGE_MONTH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_change_month)],
+            SHOP_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, shop_menu_handler)],
+            ADD_SHOP: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_shop)],
+            DELETE_SHOP: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_shop)],
+            SHOP_ITEMS_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, shop_items_handler)],
+            ADD_ITEM: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_item)],
+            DELETE_ITEM: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_item)],
+            BOZOR_SELECT_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, bozor_date_selected)],
+            BOZOR_SHOP_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, bozor_shop_handler)],
+            BOZOR_ITEM_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, bozor_item_handler)],
+            BOZOR_UNIT_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, bozor_unit_handler)],
+            BOZOR_KG_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, bozor_kg_save)],
+            BOZOR_DONA_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, bozor_dona_save)],
+            NARX_SELECT_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, narx_date_selected)],
+            NARX_SHOP_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, narx_shop_handler)],
+            NARX_ITEM_MENU: [
+                MessageHandler(filters.Regex("^(💰|⚖️|⬅️)"), narx_item_action),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, narx_item_handler),
+            ],
+            NARX_UNIT_CHANGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, narx_unit_change)],
+            NARX_KG_CHANGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, narx_kg_change)],
+            NARX_DONA_CHANGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, narx_dona_change)],
+            ENTER_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_price)],
+            HISOBOT_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, hisobot_date_handler)],
+            OXIRGI_AMAL_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, oxirgi_amal_date)],
         },
-        fallbacks=[
-            CommandHandler("start", start),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, fallback),
-        ],
+        fallbacks=[CommandHandler("start", start)],
         allow_reentry=True,
-        conversation_timeout=600,
+        per_user=True,
+        per_chat=True,
     )
+
     app.add_handler(conv)
     logger.info("🤖 Bot ishga tushdi!")
     app.run_polling(drop_pending_updates=True)
